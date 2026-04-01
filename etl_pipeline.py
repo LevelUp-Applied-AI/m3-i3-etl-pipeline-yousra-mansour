@@ -6,19 +6,22 @@ validates data quality, and loads results to a database table and CSV file.
 from sqlalchemy import create_engine
 import pandas as pd
 import os
+from pathlib import Path
 
 
 def extract(engine):
-    """Extract all source tables from PostgreSQL into DataFrames.
+    with engine.connect() as conn:
+        customers = pd.read_sql("SELECT * FROM customers", conn)
+        products = pd.read_sql("SELECT * FROM products", conn)
+        orders = pd.read_sql("SELECT * FROM orders", conn)
+        order_items = pd.read_sql("SELECT * FROM order_items", conn)
 
-    Args:
-        engine: SQLAlchemy engine connected to the amman_market database
-
-    Returns:
-        dict: {"customers": df, "products": df, "orders": df, "order_items": df}
-    """
-    # TODO: Implement extraction
-    pass
+        return {
+            "customers": customers,
+            "products": products,
+            "orders": orders,
+            "order_items": order_items
+        }
 
 
 def transform(data_dict):
@@ -40,8 +43,82 @@ def transform(data_dict):
             customer_id, customer_name, city, total_orders,
             total_revenue, avg_order_value, top_category
     """
-    # TODO: Implement transformation
-    pass
+    customers = data_dict["customers"].copy()
+    products = data_dict["products"].copy()
+    orders = data_dict["orders"].copy()
+    order_items = data_dict["order_items"].copy()
+
+    merged_items = order_items.merge(products, on="product_id", how="left")
+    merged_items["line_total"] = merged_items["quantity"] * merged_items["unit_price"]
+
+    active_orders = orders[orders["status"] != "cancelled"]
+    filtered_items = merged_items[merged_items["quantity"] <= 100]
+    filtered_orders = filtered_items.merge(
+        active_orders[["order_id", "customer_id"]], on="order_id", how="inner"
+    )
+
+    if filtered_orders.empty:
+        return pd.DataFrame(
+            columns=[
+                "customer_id",
+                "customer_name",
+                "city",
+                "total_orders",
+                "total_revenue",
+                "avg_order_value",
+                "top_category"
+            ]
+        )
+
+    order_revenue = (
+        filtered_orders
+        .groupby(["customer_id", "order_id"], as_index=False)
+        .agg(order_revenue=("line_total", "sum"))
+    )
+
+    customer_orders = (
+        order_revenue
+        .groupby("customer_id", as_index=False)
+        .agg(
+            total_orders=("order_id", "nunique"),
+            avg_order_value=("order_revenue", "mean")
+        )
+    )
+
+    customer_revenue = (
+        filtered_orders
+        .groupby("customer_id", as_index=False)
+        .agg(total_revenue=("line_total", "sum"))
+    )
+
+    top_category = (
+        filtered_orders
+        .groupby(["customer_id", "category"], as_index=False)
+        .agg(category_revenue=("line_total", "sum"))
+        .sort_values(["customer_id", "category_revenue"], ascending=[True, False])
+        .drop_duplicates("customer_id")
+        .rename(columns={"category": "top_category"})
+        [["customer_id", "top_category"]]
+    )
+
+    summary = customers[["customer_id", "customer_name", "city"]].merge(
+        customer_revenue, on="customer_id", how="inner"
+    )
+    summary = summary.merge(customer_orders, on="customer_id", how="inner")
+    summary = summary.merge(top_category, on="customer_id", how="left")
+    summary["avg_order_value"] = summary["avg_order_value"].round(2)
+
+    return summary[
+        [
+            "customer_id",
+            "customer_name",
+            "city",
+            "total_orders",
+            "total_revenue",
+            "avg_order_value",
+            "top_category"
+        ]
+    ]
 
 
 def validate(df):
@@ -62,8 +139,19 @@ def validate(df):
     Raises:
         ValueError: if any critical check fails
     """
-    # TODO: Implement validation
-    pass
+    checks = {
+        "customer_id_no_null": not df["customer_id"].isnull().any(),
+        "customer_name_no_null": not df["customer_name"].isnull().any(),
+        "total_revenue_positive": (df["total_revenue"] > 0).all(),
+        "no_duplicate_customer_id": not df["customer_id"].duplicated().any(),
+        "total_orders_positive": (df["total_orders"] > 0).all()
+    }
+
+    failed = [name for name, passed in checks.items() if not passed]
+    if failed:
+        raise ValueError(f"Validation failed: {', '.join(failed)}")
+
+    return checks
 
 
 def load(df, engine, csv_path):
@@ -74,19 +162,28 @@ def load(df, engine, csv_path):
         engine: SQLAlchemy engine
         csv_path: path for CSV output
     """
-    # TODO: Implement loading
-    pass
+    output_file = Path(csv_path)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    df.to_sql("customer_summary", con=engine, if_exists="replace", index=False)
+    df.to_csv(output_file, index=False)
 
 
 def main():
     """Orchestrate the ETL pipeline: extract -> transform -> validate -> load."""
-    # TODO: Implement main orchestration
-    # 1. Create engine from DATABASE_URL env var (or default)
-    # 2. Extract
-    # 3. Transform
-    # 4. Validate
-    # 5. Load to customer_summary table and output/customer_analytics.csv
-    pass
+    database_url = os.getenv(
+        "DATABASE_URL",
+        "postgresql://postgres:postgres@localhost/amman_market"
+    )
+    engine = create_engine(database_url)
+
+    data_dict = extract(engine)
+    print("Extracted data frames:", {k: len(v) for k, v in data_dict.items()})
+
+    summary = transform(data_dict)
+    validation_results = validate(summary)
+
+    load(summary, engine, Path("output") / "customer_analytics.csv")
+    print("ETL complete. Validation results:", validation_results)
 
 
 if __name__ == "__main__":
